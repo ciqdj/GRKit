@@ -12,6 +12,8 @@
  *     (FAST_PLAN_INDEX), so no plan file reaches the card;
  *   - reads each card file and directory of the start once (the cache), as
  *     nothing but this file changes the card until INSTALL ends;
+ *   - keeps the effects and the modules of the start in one card file
+ *     (the pack), which the next start reads in one call;
  *   - checks at each INSTALL call that its data did not change since the
  *     last call (data_changed), as the head of the install file checks the
  *     code, then starts INSTALL from the .data of the file and a clear .bss
@@ -33,6 +35,7 @@ typedef unsigned int u32;
 #include "target.h"
 /* The status word of the head in the script array (FAST_STATUS_INDEX). */
 #include "fast.h"
+#include "calls.h"
 #include "../install_status.h"
 
 typedef int (*printf_fn)(const char *, ...);
@@ -71,6 +74,7 @@ typedef int (*fs_stat_fn)(const char *name, void *out);
 #define EBADF_ERROR (-9L)
 #define EEXIST_ERROR (-17L)
 #define EMFILE_ERROR (-24L)
+#define ENOSYS_ERROR (-38L)
 
 static u32 slen(const char *s) { u32 n = 0; while (s[n]) ++n; return n; }
 static int seq(const char *a, const char *b) { while (*a && *a == *b) { ++a; ++b; } return *a == *b; }
@@ -142,7 +146,14 @@ static struct ram_file *ram_make(const char *path)
 /* ---- directory listings --------------------------------------------------- */
 #define LIST_NAMES 256U
 #define NAME_SIZE 16U    /* 8.3 names */
-struct listing { u32 count; char names[LIST_NAMES][NAME_SIZE]; };
+/* With `meta`, each entry also has its size, the stamp of its times, and
+   whether it is a directory (list_directory). */
+struct listing {
+    u32 count; int meta;
+    char names[LIST_NAMES][NAME_SIZE];
+    u32 size[LIST_NAMES], stamp[LIST_NAMES];
+    u8 directory[LIST_NAMES];
+};
 #define LISTINGS 4U
 static struct listing listings[LISTINGS];
 static int listing_used[LISTINGS];
@@ -162,7 +173,8 @@ static u8 dir_entry[2048] __attribute__((aligned(8)));
 #define CACHE_FILES 96U
 #define CACHE_MISSING 32U
 #define CACHE_LISTINGS 8U
-struct cached_file { char dos[DOS_SIZE]; u32 offset, size; };
+/* `listed`: the folder listing gave the size and the stamp of the file. */
+struct cached_file { char dos[DOS_SIZE]; u32 offset, size, stamp; u8 listed, packed; };
 struct cached_listing { char dos[DOS_SIZE]; struct listing list; };
 struct cache {
     u32 used, files, missing, listings;
@@ -202,26 +214,234 @@ static void cache_forget(const char *dos)
         copy_name(f->dos, last->dos);
         f->offset = last->offset;
         f->size = last->size;
+        f->stamp = last->stamp;
+        f->listed = last->listed;
+        f->packed = last->packed;
     }
     cache.missing = 0;
     cache.listings = 0;
 }
+static int list_directory(const char *dos, struct listing *l);
+/* The cached listing of the folder of `dos`, or 0. With `list`, the folder
+   is listed into the cache when it is not there. */
+static struct listing *folder_listing(const char *dos, int list, const char **name)
+{
+    u32 cut = 0;
+    for (u32 i = 0; dos[i]; ++i) if (dos[i] == '\\') cut = i;
+    if (cut < 3) return 0;
+    char folder[DOS_SIZE];
+    for (u32 i = 0; i < cut; ++i) folder[i] = dos[i];
+    folder[cut] = 0;
+    *name = dos + cut + 1;
+    struct listing *l = cache_listing(folder);
+    if (l || !list || cache.listings >= CACHE_LISTINGS || cache_missing(folder)) return l;
+    struct cached_listing *c = &cache.listing[cache.listings];
+    if (list_directory(folder, &c->list)) { cache_note_missing(folder); return 0; }
+    copy_name(c->dos, folder);
+    ++cache.listings;
+    return &c->list;
+}
+static int listed_file(const char *dos, int list, u32 *size, u32 *stamp);
 
+/* ---- the pack ----------------------------------------------------------------
+   The effects and the modules of a start, in one card file (FAST_PACK_FILE)
+   that the next start reads in one call. A packed file serves an open only
+   while the listing of its folder gives the same size and stamp, so a
+   changed file reads from the card. After a successful INSTALL, the pack is
+   written again when its files differ from those of the start. A sum covers
+   the whole pack, so a pack that a power loss cut is not used. */
+#define PACK_MAGIC 0x504b5247U  /* "GRKP" */
+#define PACK_VERSION 1U
+#define PACK_FILES 64U
+struct pack_entry { char dos[DOS_SIZE]; u32 size, stamp, offset; };
+struct pack_header { u32 magic, version, count, sum, bytes; struct pack_entry entry[PACK_FILES]; };
+static const char *const pack_folders[] = FAST_PACK_FOLDERS;
+/* The pack that this start read, or 0. */
+static const struct pack_header *pack __attribute__((section(".fast_keep")));
+static int pack_tried __attribute__((section(".fast_keep")));
+static u32 pack_sum(u32 sum, const u8 *p, u32 n)
+{
+    for (u32 i = 0; i < n; ++i) { sum ^= p[i]; sum *= 0x01000193U; }
+    return sum;
+}
+/* A file of a pack folder: the folder, then a backslash and the name. */
+static int pack_folder(const char *dos)
+{
+    for (u32 k = 0; k < sizeof pack_folders / sizeof pack_folders[0]; ++k) {
+        const char *f = pack_folders[k];
+        u32 n = slen(f), i = 0;
+        while (i < n) {
+            char x = dos[i], y = f[i];
+            if (x >= 'a' && x <= 'z') x = (char)(x - 32);
+            if (y >= 'a' && y <= 'z') y = (char)(y - 32);
+            if (x != y) break;
+            ++i;
+        }
+        if (i == n && dos[n] == '\\' && dos[n + 1]) return 1;
+    }
+    return 0;
+}
+static void pack_load(void)
+{
+    if (pack_tried) return;
+    pack_tried = 1;
+    u32 st[16];
+    if (FS_SIZE(FAST_PACK_FILE, st)) return;
+    u32 size = st[2], at = cache.used, len = 0;
+    if (size < sizeof(struct pack_header) || size > CACHE_BYTES - at) return;
+    int f = FS_OPEN(FAST_PACK_FILE, MODE_RDWR, 0);
+    if (f < 0) return;
+    int failed = FS_READ((u32)f, cache.bytes + at, size, &len);
+    FS_CLOSE((u32)f);
+    if (failed) return;
+    struct pack_header *h = (struct pack_header *)(cache.bytes + at);
+    if (h->magic != PACK_MAGIC || h->version != PACK_VERSION || h->count > PACK_FILES ||
+        h->bytes != size - sizeof(struct pack_header)) return;
+    for (u32 i = 0; i < h->count; ++i) {
+        const struct pack_entry *e = &h->entry[i];
+        if (e->offset > h->bytes || e->size > h->bytes - e->offset || !e->dos[0] || e->dos[DOS_SIZE - 1]) return;
+    }
+    u32 sum = h->sum;
+    h->sum = 0;
+    int valid = pack_sum(0x811c9dc5U, cache.bytes + at, size) == sum;
+    h->sum = sum;
+    if (!valid) return;
+    pack = h;
+    cache.used = (at + size + 7U) & ~7U;
+}
+/* The packed file `dos` with this size and stamp, entered in the cache, or 0. */
+static struct cached_file *pack_file(const char *dos, u32 size, u32 stamp)
+{
+    pack_load();
+    if (!pack || cache.files >= CACHE_FILES) return 0;
+    for (u32 i = 0; i < pack->count; ++i) {
+        const struct pack_entry *e = &pack->entry[i];
+        if (e->size != size || e->stamp != stamp || !same_name(e->dos, dos)) continue;
+        struct cached_file *c = &cache.file[cache.files++];
+        copy_name(c->dos, dos);
+        c->offset = (u32)((const u8 *)(pack + 1) - cache.bytes) + e->offset;
+        c->size = size;
+        c->stamp = stamp;
+        c->listed = 1;
+        c->packed = 1;
+        return c;
+    }
+    return 0;
+}
+/* Write the pack again when the files of the pack folders that this start
+   read differ from those of the pack that it read. */
+static struct pack_header pack_next;
+static const u8 pack_zero[8];
+static void pack_save(void)
+{
+    u32 n = 0, bytes = 0, same = pack != 0;
+    for (u32 i = 0; i < cache.files && n < PACK_FILES; ++i) {
+        const struct cached_file *c = &cache.file[i];
+        if (!c->listed || !pack_folder(c->dos)) continue;
+        struct pack_entry *e = &pack_next.entry[n++];
+        for (u32 k = 0; k < DOS_SIZE; ++k) e->dos[k] = 0;
+        copy_name(e->dos, c->dos);
+        e->size = c->size;
+        e->stamp = c->stamp;
+        e->offset = bytes;
+        bytes = (bytes + c->size + 7U) & ~7U;
+        same &= c->packed;
+    }
+    if (!n || (same && n == pack->count)) return;
+    if (sizeof(struct pack_header) + bytes > CACHE_BYTES) return;
+    for (u32 i = n; i < PACK_FILES; ++i)
+        for (u32 k = 0; k < sizeof pack_next.entry[i]; ++k) ((u8 *)&pack_next.entry[i])[k] = 0;
+    pack_next.magic = PACK_MAGIC;
+    pack_next.version = PACK_VERSION;
+    pack_next.count = n;
+    pack_next.bytes = bytes;
+    pack_next.sum = 0;
+    u32 sum = pack_sum(0x811c9dc5U, (const u8 *)&pack_next, sizeof pack_next);
+    for (u32 i = 0, k = 0; i < cache.files && k < n; ++i) {
+        const struct cached_file *c = &cache.file[i];
+        if (!c->listed || !pack_folder(c->dos)) continue;
+        sum = pack_sum(sum, cache.bytes + c->offset, c->size);
+        sum = pack_sum(sum, pack_zero, ((c->size + 7U) & ~7U) - c->size);
+        ++k;
+    }
+    pack_next.sum = sum;
+    /* A cut write leaves a pack with another sum, which the next start does
+       not use. */
+    u32 st[16];
+    if (FS_SIZE(FAST_PACK_FILE, st)) {
+        int f = FS_CREATE(FAST_PACK_FILE, 0);
+        if (f < 0) return;
+        FS_CLOSE((u32)f);
+    }
+    int f = FS_OPEN(FAST_PACK_FILE, MODE_TRUNCATE, 0);
+    if (f < 0) return;
+    u32 len = 0;
+    int failed = FS_WRITE((u32)f, &pack_next, sizeof pack_next, &len);
+    for (u32 i = 0, k = 0; !failed && i < cache.files && k < n; ++i) {
+        const struct cached_file *c = &cache.file[i];
+        if (!c->listed || !pack_folder(c->dos)) continue;
+        u32 pad = ((c->size + 7U) & ~7U) - c->size;
+        failed = (c->size && FS_WRITE((u32)f, (void *)(cache.bytes + c->offset), c->size, &len)) ||
+                 (pad && FS_WRITE((u32)f, (void *)pack_zero, pad, &len));
+        ++k;
+    }
+    FS_CLOSE((u32)f);
+}
+
+/* A file of a cached listing with sizes: 1 with its size and stamp, 0 when
+   the listing does not have it, or -1 without such a listing. */
+static int listed_file(const char *dos, int list, u32 *size, u32 *stamp)
+{
+    const char *name = 0;
+    struct listing *l = folder_listing(dos, list, &name);
+    if (!l || !l->meta) return -1;
+    for (u32 i = 0; i < l->count; ++i)
+        if (same_name(l->names[i], name)) {
+            if (l->directory[i]) return -1;
+            *size = l->size[i];
+            *stamp = l->stamp[i];
+            return 1;
+        }
+    return l->count < LIST_NAMES ? 0 : -1;
+}
+
+/* The entry that readdir fills: the name first, then the attribute byte, the
+   size, and the times (FAT date and time words). The listing uses the size
+   and the times only if each "." entry has the directory attribute, so
+   another layout falls back to a status call for each file. */
+#define ENTRY_ATTRIBUTE 779U
+#define ENTRY_SIZE 784U
+#define ENTRY_TIMES 800U
+#define ATTRIBUTE_DIRECTORY 0x10U
+static u32 entry_word(u32 offset)
+{
+    return (u32)dir_entry[offset] | (u32)dir_entry[offset + 1] << 8 | (u32)dir_entry[offset + 2] << 16 |
+           (u32)dir_entry[offset + 3] << 24;
+}
 static int list_directory(const char *dos, struct listing *l)
 {
     u32 dno = 0;
+    int dot = 0, dot_directory = 1;
     if (FS_OPENDIR(dos, &dno)) return -1;
     l->count = 0;
     for (;;) {
         for (u32 i = 0; i < sizeof dir_entry; ++i) dir_entry[i] = 0;
         if (FS_READDIR(dno, dir_entry)) break;
+        int directory = (dir_entry[ENTRY_ATTRIBUTE] & ATTRIBUTE_DIRECTORY) != 0;
+        if (dir_entry[0] == '.' && !dir_entry[1]) { dot = 1; dot_directory &= directory; }
         if (l->count >= LIST_NAMES) continue;
         u32 n = 0;
         while (n + 1 < NAME_SIZE && dir_entry[n]) { l->names[l->count][n] = (char)dir_entry[n]; ++n; }
         l->names[l->count][n] = 0;
+        l->directory[l->count] = (u8)directory;
+        l->size[l->count] = entry_word(ENTRY_SIZE);
+        /* Not the access date, which a read can change. */
+        l->stamp[l->count] = entry_word(ENTRY_TIMES) ^ (entry_word(ENTRY_TIMES + 8) * 0x9e3779b1U) ^
+                             (entry_word(ENTRY_TIMES + 12) * 0x85ebca6bU);
         ++l->count;
     }
     FS_CLOSEDIR(dno);
+    l->meta = dot && dot_directory;
     return 0;
 }
 
@@ -247,6 +467,10 @@ static long slot(void)
 }
 static u32 card_size(const char *dos, int *exists)
 {
+    /* A cached listing of the folder answers without a call. */
+    u32 size = 0, stamp = 0;
+    int listed = listed_file(dos, 0, &size, &stamp);
+    if (listed >= 0) { *exists = listed; return size; }
     /* The file status: 64 bytes, as the head and SYS_memovr give it. The
        call fills it, so it has no initializer, which would need memset. */
     u32 st[16];
@@ -311,6 +535,14 @@ static long do_open(const char *path, u32 flags)
                 return (long)(s + FIRST_FD);
             }
             if (cache_missing(dos)) return ENOENT_ERROR;
+            u32 listed_size = 0, stamp = 0;
+            int listed = listed_file(dos, 0, &listed_size, &stamp);
+            if (listed > 0 && pack_folder(dos) && (c = pack_file(dos, listed_size, stamp))) {
+                o->bytes = cache.bytes + c->offset;
+                o->size = c->size;
+                o->kind = CACHED_FILE;
+                return (long)(s + FIRST_FD);
+            }
             o->size = card_size(dos, &exists);
             if (!exists) { cache_note_missing(dos); return ENOENT_ERROR; }
             int f = FS_OPEN(dos, MODE_RDWR, 0);
@@ -325,6 +557,9 @@ static long do_open(const char *path, u32 flags)
                 copy_name(c->dos, dos);
                 c->offset = at;
                 c->size = o->size;
+                c->stamp = stamp;
+                c->listed = listed > 0 && listed_size == o->size;
+                c->packed = 0;
                 cache.used = (at + o->size + 7U) & ~7U;
                 o->bytes = cache.bytes + at;
                 o->kind = CACHED_FILE;
@@ -474,6 +709,15 @@ long syscall6(u32 number, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f)
     case 0xf0002: /* msync alias -> real cache maintenance over [a, b) */
         cache_sync(a, b - a);
         return 0;
+    case FAST_FILE_STAMP: /* the size and the stamp of the times of a file, from its listing */
+        if (!dos_path((const char *)a, dos)) return ENOENT_ERROR;
+        { u32 size = 0, stamp = 0;
+          int listed = listed_file(dos, 1, &size, &stamp);
+          if (listed < 0) return ENOSYS_ERROR;
+          if (!listed) return ENOENT_ERROR;
+          ((u32 *)b)[0] = size;
+          ((u32 *)b)[1] = stamp;
+          return 0; }
     default:
         return -38;
     }
@@ -618,6 +862,8 @@ __attribute__((used)) int rtos_fastboot_install(u32 *ba)
     }
     data_reset();
     int s = on_stack(install, ba, stack + STACK_SIZE);
+    /* After the install, so it does not delay it. */
+    if (!s) pack_save();
     data_seal();
     return s;
 }
