@@ -3,7 +3,7 @@ name: Auto Sync Upstream
 on:
   workflow_dispatch: # 支持手动触发
   schedule:
-    - cron: '0 0 * * *' # 可以根据需要调整定时同步的时间
+    - cron: '0 */8 * * *' # 可以根据需要调整定时同步的时间
 
 jobs:
   sync:
