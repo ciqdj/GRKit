@@ -45,7 +45,7 @@ typedef unsigned int u32;
 static const char *const core_setting_names[] = {
     "CORE.TONE", "CORE.ASPECT", "CORE.GRAIN", "CORE.GRAIN_SIZE", "CORE.ASPECT_MODE", "CORE.ADJ",
     "CORE.ADJ_MODULE"};
-static const u32 core_setting_points[] = {0x12, 0xc, 0x20, 0x40, 0xc};
+static const u32 core_setting_points[] = {0x12, 0xc, 0x20, 0x40, 0xc, 0x0, 0x0};
 /* The tail of the core, and its one export, overlay_label. */
 #define TAIL 0x54000000U
 #define TAIL_SYMBOL 0U
@@ -776,6 +776,17 @@ static void setting_defaults_and_saved_zero(void)
     save_state(pairs, 1);
     assert(install() == 0);
     assert(kept_count == 1 && kept_ids[0] == pairs[0] && kept_values[0] == 0);
+
+    /* CORE.ADJ and CORE.ADJ_MODULE belong to no module, and INSTALL
+       restores them (apply_state). They are not kept: the loader would write
+       the kept value after the current one, and the old value would win at
+       the next start. */
+    const u32 adj[] = {id_of("CORE.ADJ"), 1, id_of("CORE.ADJ_MODULE"), 3};
+    reset();
+    add_module(PACKAGE_MODULES_PATH, "GUIDES.GRM", &guides);
+    save_state(adj, 2);
+    assert(install() == 0);
+    assert(state_taken(adj[0]) && state_taken(adj[2]) && kept_count == 0);
 }
 /* SCAN and INSTALL keep the framing mode available for the state restore,
    including when Framing loads stopped. This harness does not run the
