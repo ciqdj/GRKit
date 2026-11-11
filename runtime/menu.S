@@ -206,7 +206,8 @@ menu_icon_descriptor:
 
 #ifdef HOOK_MENU_NATIVE_ADJ_APPLY
 /* Native pages apply each highlighted Image Control immediately. Preview it in
-   the live view (GRKIT_HOST_PREVIEW = 1) and keep the private selection until a native OK. */
+   the live view (GRKIT_HOST_PREVIEW = 1) and keep the private selection until a native OK,
+   or a half-press on the ADJ slot with another type (runtime/menu.c: native_ic_chosen). */
 .macro NATIVE_APPLY name, resume
 .global \name
 .type \name, %function
@@ -876,4 +877,22 @@ menu_develop_aspect_top_text:
     b menu_develop_aspect_label
 .ltorg
 #endif
+#endif
+#include "crop.S"
+#ifdef HOOK_CROP_BUTTON
+.arm
+/* The entry of the camera's crop button (ChangeCrop): with CORE.CROP in
+   use, the button steps its crops (runtime/menu.c: crop_button_press) and
+   the camera's own step does not run. */
+.global crop_button
+.type crop_button, %function
+crop_button:
+    push {r0-r3,r12,lr}
+    bl crop_button_press
+    cmp r0, #0
+    pop {r0-r3,r12,lr}
+    bxne lr
+    mov r12, sp
+    ldr pc, =HOOK_CROP_BUTTON_RESUME
+.ltorg
 #endif

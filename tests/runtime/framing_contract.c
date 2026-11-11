@@ -23,11 +23,20 @@ static uint32_t native_aspect, capture_aspect, capture_requests;
 #define TEST_LAYERS 0x59000000U
 static uint32_t layer_memory[128/4];
 static uint32_t indicator_memory[256/4], icon_memory[40*6412/4];
+/* Native views of the canvas: TEST_VIEW_COUNT views of TEST_VIEW_SIZE bytes,
+   then their child vectors. */
+#define TEST_VIEWS 0x57000000U
+#define TEST_VIEW_SIZE 0xa0U
+#define TEST_VIEW_COUNT 9U
+#define TEST_VECTORS (TEST_VIEWS+TEST_VIEW_COUNT*TEST_VIEW_SIZE)
+static uint32_t view_memory[(TEST_VIEW_COUNT*TEST_VIEW_SIZE+0x100)/4];
 
 static void *mapped(uint32_t address, uint32_t bytes)
 {
     uint32_t *object, size = sizeof(canvas_memory);
-    if (address >= TEST_LAYERS && address < TEST_LAYERS + sizeof(layer_memory)) {
+    if (address >= TEST_VIEWS && address < TEST_VIEWS + sizeof(view_memory)) {
+        object = view_memory; address -= TEST_VIEWS; size = sizeof(view_memory);
+    } else if (address >= TEST_LAYERS && address < TEST_LAYERS + sizeof(layer_memory)) {
         object = layer_memory; address -= TEST_LAYERS; size = sizeof(layer_memory);
     } else if (address >= TEST_INDICATOR && address < TEST_INDICATOR + sizeof(indicator_memory)) {
         object = indicator_memory; address -= TEST_INDICATOR; size = sizeof(indicator_memory);
@@ -117,6 +126,19 @@ static uint32_t profile_core_id;
 #define TEST_GUIDES_PAINT 0x5e000001U
 #define TEST_GUIDES_ALWAYS_PAINT 0x5e000031U
 #define TEST_BADGE_PAINT 0x5e000021U
+/* A layer bound to CORE.CROP: it records the surface that the core gives
+   it. The module test of Crop checks its mask. */
+#define TEST_CROP_PAINT 0x5e000041U
+/* The camera's crop factor (runtime/crop.h): float bits, the setter calls,
+   and the factor in 1/65536 that the frames take. */
+static uint32_t native_crop_bits = 0x3f800000U, native_crop_sets, native_crop_q16 = 65536U;
+#define CROP_NATIVE_BITS() (native_crop_bits)
+#define CROP_NATIVE_SET(bits) (native_crop_bits = (bits), ++native_crop_sets)
+#define CROP_NATIVE_Q16() (native_crop_q16)
+/* GR IIIx: the lens of 40 mm that the GR III family runtime asks for. */
+#undef CROP_LENS_40MM
+static uint32_t lens_40mm;
+#define CROP_LENS_40MM() (lens_40mm)
 static void test_module_paint(uint32_t address, const void *surface, uint32_t value);
 #define MODULE_PAINT(address,surface,value) test_module_paint(address,surface,value)
 static uint32_t level_updates, level_updated;
@@ -135,8 +157,19 @@ static void legacy_badge(const Surface *surface,u32 value) {
     if(surface->area && !setting_get(SETTING_LABEL))
         overlay_label(surface,LABEL_RATIO(surface->area),LABEL_LEFT,LABEL_TOP);
 }
+/* The last surface of the crop layer and of the Guides layer. */
+static u32 crop_calls, crop_area, crop_value;
+static u16 crop_box_seen[4], guides_box_seen[4];
 static void test_module_paint(uint32_t address, const void *surface, uint32_t value)
 {
+    const Surface *s = surface;
+    if (address == TEST_CROP_PAINT) {
+        ++crop_calls; crop_area = s->area; crop_value = value;
+        memcpy(crop_box_seen, s->box, sizeof(crop_box_seen));
+        return;
+    }
+    if (address == TEST_GUIDES_PAINT || address == TEST_GUIDES_ALWAYS_PAINT)
+        memcpy(guides_box_seen, s->box, sizeof(guides_box_seen));
     if (address == TEST_MASK_PAINT) framing_mask(surface, value);
     else if (address == TEST_GUIDES_ALWAYS_PAINT) guides_paint_always(surface, value);
     else if (address == TEST_BADGE_PAINT) legacy_badge(surface, value);
@@ -686,6 +719,102 @@ static void status_row_lays_out_core_labels(void)
     assert(!cue_shown(header));
     assert(pixels[1+STATUS_TOP*TEST_STRIDE+STATUS_ONE]==0xff000013U);
 }
+/* Native view `i` at x, y, width, height, visible, without children. */
+static u32 test_view(u32 i,int x,int y,int w,int h,u32 visible)
+{
+    u32 view=TEST_VIEWS+i*TEST_VIEW_SIZE;
+    memset((uint8_t *)view_memory+i*TEST_VIEW_SIZE,0,TEST_VIEW_SIZE);
+    WORD(view,VIEW_SCREEN)=(u32)x; WORD(view,VIEW_SCREEN+4)=(u32)y;
+    WORD(view,VIEW_SCREEN+8)=(u32)w; WORD(view,VIEW_SCREEN+12)=(u32)h;
+    BYTE(view,VIEW_VISIBLE)=(uint8_t)visible;
+    return view;
+}
+/* The children of `parent`: the views in `views`, in a vector at `vector`. */
+static void test_children(u32 parent,u32 vector,const u32 *views,u32 count)
+{
+    for(u32 i=0;i<count;++i) WORD(vector,i*4)=views[i];
+    WORD(parent,VIEW_CHILDREN)=vector;
+    WORD(parent,VIEW_CHILDREN+4)=vector+count*4;
+}
+/* The first column of the status row where `color` shows, or 720. */
+static u32 status_column(u32 color)
+{
+    for(u32 x=0;x<720;++x) if(pixels[1+STATUS_TOP*TEST_STRIDE+x]==color) return x;
+    return 720;
+}
+static void status_paint_again(void)
+{
+    for (u32 i=0; i<sizeof(pixels)/sizeof(pixels[0]); ++i) pixels[i]=SENTINEL;
+    framing_paint(TEST_CANVAS,TEST_BITMAP);
+}
+/* The row takes the rightmost free part of the second row, STATUS_GAP from
+   each visible native view: the focus distance (600) and the dial guide of
+   GR IV Snap mode (440 to 600). A hidden view, the children of a hidden
+   view, a view that crosses the row, and a view as wide as the screen leave
+   the row free. When no free
+   part holds every indicator, the widest one holds the first ones. */
+static void status_row_avoids_native_views(void)
+{
+    reset();
+    header[GRKIT_HOST_MODULE_LAYER_COUNT/4]=0;
+    header[GRKIT_HOST_FRAME_RATIO/4]=0;
+    header[GRKIT_HOST_INDICATOR_COUNT/4]=2;
+    header[GRKIT_HOST_ICON_CHUNKS/4]=TEST_ICONS;
+    settings_memory[0]=4;
+    for(u32 i=0;i<4;++i) {
+        settings_memory[SETTINGS_ENTRY(i)+1]=i%2 ? 0 : 1;
+        settings_memory[SETTINGS_ENTRY(i)+2]=i%2 ? 3 : 2;
+    }
+    for(u32 i=0;i<2;++i) {
+        u32 d=TEST_INDICATOR+i*128,c=d+32,icon=d+64;
+        WORD(d,0)=24; WORD(d,4)=2; WORD(d,8)=0;
+        WORD(d,12)=1; WORD(d,16)=c; WORD(d,20)=icon;
+        WORD(c,0)=i*2; WORD(c,4)=1; WORD(c,8)=1;
+        WORD(icon,0)=16; WORD(icon,4)=1; WORD(icon,8)=i*2+1; WORD(icon,12)=i*3;
+        header[GRKIT_HOST_INDICATORS/4+i*2]=d;
+        header[GRKIT_HOST_INDICATORS/4+i*2+1]=0;
+    }
+    memset(icon_memory,0,sizeof(icon_memory));
+    for(u32 i=0;i<6;++i) {
+        u32 icon=module_tile_address(header,GRKIT_ICON_MODULE_TILE(i));
+        WORD(icon,GRKIT_ICON_STRIDE-GRKIT_GRF_ICON_SIZE)=0xff000010U+i;
+    }
+    /* The canvas: a full-screen parent, the focus distance, a hidden icon at
+       the right, and the Snap dial guide (a parent of two views, and one
+       more view). */
+    u32 full=test_view(0,0,0,720,480,1),distance=test_view(1,600,40,80,40,1),hidden=test_view(2,680,40,40,40,0);
+    u32 guide=test_view(3,440,40,120,40,1),dial=test_view(4,440,40,40,40,1),value=test_view(5,480,40,80,40,1);
+    u32 rear=test_view(6,560,40,40,40,1),shift=test_view(7,100,40,250,20,0);
+    /* A focus frame at the top of the photo crosses the row. */
+    u32 focus=test_view(8,328,60,64,52,1);
+    u32 top[]={full,distance,hidden,guide,rear,shift,focus},parts[]={dial,value};
+    test_children(guide,TEST_VECTORS,parts,2);
+    test_children(TEST_CANVAS,TEST_VECTORS+0x20,top,7);
+    BYTE(guide,VIEW_VISIBLE)=0; BYTE(rear,VIEW_VISIBLE)=0;
+    framing_bind(TEST_OWNER);
+    /* The focus distance alone: the row ends at STATUS_RIGHT, 20 columns
+       before it, as without native views. The full-screen view, the hidden
+       icon at the right, the children of the hidden guide, and the focus
+       frame that crosses the row do not count. */
+    status_paint_again();
+    assert(status_column(0xff000013U)==STATUS_RIGHT-40);
+    assert(status_column(0xff000010U)==STATUS_RIGHT-STATUS_STEP-40);
+    /* Snap mode: the row ends STATUS_GAP before the dial guide. */
+    BYTE(guide,VIEW_VISIBLE)=1; BYTE(rear,VIEW_VISIBLE)=1;
+    status_paint_again();
+    assert(status_column(0xff000013U)==440-STATUS_GAP-40);
+    assert(status_column(0xff000010U)==440-STATUS_GAP-STATUS_STEP-40);
+    /* A wide native view leaves 7 to 80 and 370 to 420. The widest part
+       holds only the first icon, at its right end. */
+    BYTE(shift,VIEW_VISIBLE)=1;
+    status_paint_again();
+    assert(status_column(0xff000010U)==100-STATUS_GAP-40);
+    assert(status_column(0xff000013U)==720);
+    /* No free part holds an icon: no row. */
+    WORD(shift,VIEW_SCREEN)=0; WORD(shift,VIEW_SCREEN+8)=700;
+    status_paint_again();
+    assert(status_column(0xff000010U)==720 && status_column(0xff000013U)==720);
+}
 /* The widest set of the official indicators fits between STATUS_LEFT and
    STATUS_RIGHT: a Framing ratio, a Date Imprint format, and the Bloom,
    Halation, and Grain icons. */
@@ -706,13 +835,194 @@ static void status_row_fits_the_official_indicators(void)
     assert(ratio+STATUS_LABEL_GAP+date+STATUS_LABEL_GAP+2*STATUS_STEP+40<=STATUS_RIGHT-STATUS_LEFT);
 }
 
+/* A crop frames the center of the layer area. The crop layer gets the
+   frame with the crop as its area, and Guides draw inside the frame. */
+#define CROP_BIT (1U << (GRKIT_CORE_CROP - GRKIT_CORE_SETTING_BASE))
+static void add_crop_layer(void)
+{
+    u32 n = header[GRKIT_HOST_MODULE_LAYER_COUNT/4];
+    header[GRKIT_HOST_MODULE_LAYERS/4 + n*4] = TEST_CROP_PAINT;
+    header[GRKIT_HOST_MODULE_LAYERS/4 + n*4 + 1] = GRKIT_CORE_CROP;
+    header[GRKIT_HOST_MODULE_LAYERS/4 + n*4 + 2] = 15U << 16;
+    header[GRKIT_HOST_MODULE_LAYERS/4 + n*4 + 3] = 0;
+    header[GRKIT_HOST_MODULE_LAYER_COUNT/4] = n + 1;
+    header[GRKIT_HOST_CAPABILITIES/4] |= CROP_BIT;
+}
+static void assert_box(const u16 *box, u32 left, u32 top, u32 right, u32 bottom)
+{
+    assert(box[0] == left && box[1] == top && box[2] == right && box[3] == bottom);
+}
+/* The frame of `crop` in `outer` in a live view of the factor `native`, as
+   runtime/crop.h makes it, which the layers get. */
+static void assert_frame(const u16 *box, u32 left, u32 top, u32 right, u32 bottom, u32 crop, u32 native)
+{
+    const u16 outer[4] = {(u16)left, (u16)top, (u16)right, (u16)bottom};
+    u16 frame[4];
+    assert(crop_box(outer, crop_scale(crop, native), frame));
+    assert_box(box, frame[0], frame[1], frame[2], frame[3]);
+}
+static void crop_frames_the_layers(void)
+{
+    /* 50 mm in the full 3:2 view: 28/50 of each side, at the center. */
+    reset();
+    header[GRKIT_HOST_FRAME_RATIO/4] = 0;
+    add_crop_layer();
+    header[GRKIT_HOST_CROP/4] = 3;
+    GUIDE_STYLE = 1;
+    crop_calls = 0;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert(crop_calls == 1 && crop_area == 3 && crop_value == 3);
+    assert_frame(crop_box_seen, 0, 0, 720, 480, 3, 65536);
+    assert_frame(guides_box_seen, 0, 0, 720, 480, 3, 65536);
+#ifdef GRKIT_TARGET_GR3_210
+    assert_box(crop_box_seen, 158, 105, 561, 374);
+#endif
+    /* Inside the XPan crop of Framing, the frame is 28/50 of that area. */
+    reset();
+    add_crop_layer();
+    header[GRKIT_HOST_CROP/4] = 3;
+    GUIDE_STYLE = 1;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert_frame(crop_box_seen, 0, 107, 720, 373, 3, 65536);
+    assert_frame(guides_box_seen, 0, 107, 720, 373, 3, 65536);
+    /* Off, or a crop without a module that uses it, frames nothing: the
+       crop layer does not paint, and Guides divide the whole area. */
+    reset();
+    header[GRKIT_HOST_FRAME_RATIO/4] = 0;
+    add_crop_layer();
+    GUIDE_STYLE = 1;
+    crop_calls = 0;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert(crop_calls == 0);
+    assert_box(guides_box_seen, 0, 0, 720, 480);
+    header[GRKIT_HOST_CROP/4] = 3;
+    header[GRKIT_HOST_CAPABILITIES/4] &= ~CROP_BIT;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert(crop_calls == 0);
+    assert_box(guides_box_seen, 0, 0, 720, 480);
+    /* The ADJ preview of the crop page frames the highlighted crop: 90 mm. */
+    header[GRKIT_HOST_CAPABILITIES/4] |= CROP_BIT;
+    header[GRKIT_HOST_FRAME_PREVIEW/4] = 1;
+    header[GRKIT_HOST_MODULE_PREVIEW/4] = GRKIT_CORE_CROP + 1;
+    header[GRKIT_HOST_MODULE_PREVIEW/4 + 1] = 5;
+    header[GRKIT_HOST_FRAME_PREVIEW_ADJ/4] = TEST_OWNER;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert(crop_calls == 1 && crop_area == 5);
+    assert_frame(crop_box_seen, 0, 0, 720, 480, 5, 65536);
+    assert_frame(guides_box_seen, 0, 0, 720, 480, 5, 65536);
+}
+/* In 3:2 without a Framing ratio, the camera crops: the bind sets the
+   camera's factor of 35, 40, or 50 mm, and arms the factor of a 70 or 90 mm
+   shot. Frame Only, a Framing ratio, or Off return a factor that the core
+   set to Off, and a crop of the camera menu stays. */
+static void crop_sets_the_camera_factor(void)
+{
+    static const u8 lives[] = {0, 1, 2, 3, 3, 3};
+    for (u32 crop = 1; crop < GRKIT_CORE_CROP_VALUES; ++crop) {
+        u32 native = crop_factors[lives[crop]], shot = crop > 3 ? crop_factors[crop] : 0;
+        reset();
+        header[GRKIT_HOST_FRAME_RATIO/4] = 0;
+        add_crop_layer();
+        native_crop_bits = 0x3f800000U; native_crop_sets = 0;
+        header[GRKIT_HOST_CROP/4] = crop;
+        framing_bind(TEST_OWNER);
+        assert(native_crop_bits == native && native_crop_sets == 1);
+        assert(header[GRKIT_HOST_CROP_NATIVE/4] == native && header[GRKIT_HOST_CROP_SHOT/4] == shot);
+        framing_bind(TEST_OWNER);
+        assert(native_crop_sets == 1);
+        header[GRKIT_HOST_CROP_MODE/4] = 1;
+        header[GRKIT_HOST_CAPABILITIES/4] |= GRKIT_CORE_CROP_MODE_BIT;
+        framing_bind(TEST_OWNER);
+        assert(native_crop_bits == 0x3f800000U && header[GRKIT_HOST_CROP_NATIVE/4] == 0 && header[GRKIT_HOST_CROP_SHOT/4] == 0);
+    }
+#ifdef GRKIT_TARGET_GR3_210
+    /* GR III: 35, 40, and 50 mm are 1.25, 1.4286, and 1.7857; 70 and 90 mm
+       shoot at 2.5 and 3.2143. */
+    assert(crop_factors[1] == 0x3fa00000U && crop_factors[2] == 0x3fb6db6eU && crop_factors[3] == 0x3fe49249U);
+    assert(crop_factors[4] == 0x40200000U && crop_factors[5] == 0x404db6dbU);
+#endif
+    /* A Framing ratio: the frame only, and the camera keeps its own crop. */
+    reset();
+    add_crop_layer();
+    header[GRKIT_HOST_CROP/4] = 2;
+    native_crop_bits = 0x3fa00000U; native_crop_sets = 0;
+    framing_bind(TEST_OWNER);
+    assert(native_crop_sets == 0 && native_crop_bits == 0x3fa00000U);
+    /* 70 mm in the live view of the 50 mm factor: the frame is 50/70 of
+       it. 50 mm there has no frame. */
+    reset();
+    header[GRKIT_HOST_FRAME_RATIO/4] = 0;
+    add_crop_layer();
+    header[GRKIT_HOST_CROP/4] = 4;
+    GUIDE_STYLE = 1;
+    native_crop_q16 = (u32)(((unsigned long long)crop_scales[0] << 16) / crop_scales[3]);
+    crop_calls = 0;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert(crop_calls == 1);
+    assert_frame(crop_box_seen, 0, 0, 720, 480, 4, native_crop_q16);
+    assert(crop_box_seen[2] - crop_box_seen[0] > 500 && crop_box_seen[2] - crop_box_seen[0] < 530);
+    header[GRKIT_HOST_CROP/4] = 3;
+    crop_calls = 0;
+    framing_paint(TEST_CANVAS, TEST_BITMAP);
+    assert(crop_calls == 0);
+    assert_box(guides_box_seen, 0, 0, 720, 480);
+    native_crop_q16 = 65536U;
+}
+/* 40, 70, and 90 mm show the core's crop badge in the place of the camera's
+   own, which crop_badge hides; 35 and 50 mm keep the camera's. GR IIIx
+   shows its focal lengths. The badge shows only with the native
+   information, and a Framing ratio or Frame Only shows none. */
+static void crop_badges_replace_the_camera_badge(void)
+{
+    static const u32 labels[] = {GRKIT_LABEL_COUNT, GRKIT_LABEL_COUNT, LABEL_CROP, GRKIT_LABEL_COUNT, LABEL_CROP + 1, LABEL_CROP + 2};
+    for (u32 lens = 0; lens < 2; ++lens)
+        for (u32 crop = 0; crop < GRKIT_CORE_CROP_VALUES; ++crop) {
+            reset();
+            header[GRKIT_HOST_FRAME_RATIO/4] = 0;
+            add_crop_layer();
+            lens_40mm = lens;
+            header[GRKIT_HOST_CROP/4] = crop;
+            u32 expected = labels[crop] < GRKIT_LABEL_COUNT ? labels[crop] + 3 * lens : GRKIT_LABEL_COUNT;
+            assert(crop_badge_shown(header) == expected);
+            assert(crop_badge_native() == (expected >= GRKIT_LABEL_COUNT));
+            if (expected >= GRKIT_LABEL_COUNT) continue;
+            for (u32 i = 0; i < sizeof(pixels) / sizeof(pixels[0]); ++i) pixels[i] = SENTINEL;
+            framing_paint(TEST_CANVAS, TEST_BITMAP);
+            /* The badge draws after the native children. */
+            assert(pixels[1 + CROP_BADGE_TOP * TEST_STRIDE + CROP_BADGE_LEFT] != 0xff808080U);
+            framing_paint_after(TEST_CANVAS, TEST_BITMAP);
+            /* The border of the badge at its top left and bottom right. */
+            assert(pixels[1 + CROP_BADGE_TOP * TEST_STRIDE + CROP_BADGE_LEFT] == 0xff808080U);
+            assert(pixels[1 + (CROP_BADGE_TOP + 19) * TEST_STRIDE + CROP_BADGE_LEFT + 55] == 0xff808080U);
+            assert(pixels[1 + (CROP_BADGE_TOP + 1) * TEST_STRIDE + CROP_BADGE_LEFT + 1] == 0xff353535U);
+        }
+    lens_40mm = 0;
+    reset();
+    header[GRKIT_HOST_FRAME_RATIO/4] = 0;
+    add_crop_layer();
+    header[GRKIT_HOST_CROP/4] = 4;
+    display_mode = DISPLAY_SIMPLE;
+    assert(crop_badge_shown(header) == GRKIT_LABEL_COUNT);
+    display_mode = 0;
+    header[GRKIT_HOST_CROP_MODE/4] = 1;
+    header[GRKIT_HOST_CAPABILITIES/4] |= GRKIT_CORE_CROP_MODE_BIT;
+    assert(crop_badge_shown(header) == GRKIT_LABEL_COUNT && crop_badge_native());
+    reset();
+    add_crop_layer();
+    header[GRKIT_HOST_CROP/4] = 4;
+    assert(crop_badge_shown(header) == GRKIT_LABEL_COUNT);
+}
 int main(void)
 {
+    crop_frames_the_layers();
+    crop_badges_replace_the_camera_badge();
+    crop_sets_the_camera_factor();
     native_guides_follow_the_photo_area();
     guides_follow_composition_frames();
     status_icons_follow_enable_strength_and_disp();
     status_row_lays_out_core_labels();
     status_row_fits_the_official_indicators();
+    status_row_avoids_native_views();
     the_highlight_warning_follows_the_effect_white();
     the_histogram_follows_the_effect_white();
     /* Fixed rectangles are independent expected output, not a second renderer. */
