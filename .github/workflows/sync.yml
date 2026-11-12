@@ -1,33 +1,30 @@
 name: Auto Sync Upstream
 
 on:
-  workflow_dispatch: # 支持手动触发
   schedule:
-    - cron: '0 */8 * * *' # 可以根据需要调整定时同步的时间
+    - cron: '0 */8 * * *' # 每8小时自动运行一次
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     
+    # 显式声明 GitHub Token 的写权限
     permissions:
-      contents: write # 确保有写入权限
+      contents: write
 
     steps:
-      # 1. 检出仓库代码（使用最新版 actions/checkout@v5 解决警告）
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Checkout target repo
+        uses: actions/checkout@v4
 
-      # 2. 同步上游代码（修复了参数错误和旧版本警告）
       - name: Sync Upstream
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1 # 如果有更新版本也可以用 v3.4.2+
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
         with:
-          target_sync_branch: main        # 注意：这里修正了之前写错的 target_branch
-          upstream_sync_repo: ahonn/GRKit  # <-- 请修改为你的上游（原）仓库地址
-          upstream_sync_branch: main      # 上游的分支（通常是 main 或 master）
+          target_sync_branch: main
+          # 请确保改为上游实际的账号/仓库名，如: owner/repo
+          upstream_sync_repo: ahonn/GRKit<上游拥有者>/<上游仓库名>
+          upstream_sync_branch: main
           target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
-
-      # （可选）如果你需要把同步后的代码推送到你的仓库
-      - name: Check for changes
-        run: |
-          git status
+          
+          # 如果遇到冲突希望强制同步覆盖（谨慎使用，会覆盖 Fork 仓库中的本地修改）：
+          # test_mode: false
