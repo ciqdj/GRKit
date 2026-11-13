@@ -1,3 +1,9 @@
+## 1.6.0 (2026-11-13)
+
+### Features
+
+- The new Crop module crops photos to 35, 40, 50, 70, or 90 mm, with a live view and a crop badge to match.
+
 ## 1.5.6 (2026-11-11)
 
 ### Fixes
